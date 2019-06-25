@@ -154,48 +154,61 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 	var expired []*Item
 
 	iElement, ok := c.table.Load(key)
-	if !ok {
-		unCached = append(unCached, key)
-	}
-
-	el, o := iElement.(*list.Element)
-	if el == nil || el.Value == nil {
-		// never should be here
-		b = nil
-		return b, info
-	}
-	item, o := el.Value.(*Item)
-	if !o {
-		// never should be here
-		b = nil
-		return b, info
-	}
-
-	switch item.Status {
-	case OK:
-		b = item.Value
-		pushFront = append(pushFront, el)
-		info.TriggerPushFront += 1
-		info.StatusOk += 1
-		if time.Since(item.UpdatedAt) > c.Expiration {
-			expired = append(expired, item)
-			info.TriggerExpired += 1
+	if ok {
+		el, ok := iElement.(*list.Element)
+		if !ok {
+			// never should be here
+			b = nil
+			return b, info
 		}
-	case EXPIRED:
-		b = item.Value
-		pushFront = append(pushFront, el)
-		info.TriggerPushFront += 1
-		info.StatusExpired += 1
-	case MISS:
-		b = nil
-		pushFront = append(pushFront, el)
-		info.TriggerPushFront += 1
-		info.StatusMiss += 1
-	default:
-		// never should be here
-		info.StatusElse += 1
-		b = nil
-		return b, info
+
+		if el == nil || el.Value == nil {
+			// never should be here
+			b = nil
+			return b, info
+		}
+
+		item, ok := el.Value.(*Item)
+		if !ok {
+			// never should be here
+			b = nil
+			return b, info
+		}
+
+		if item == nil {
+			// never should be here
+			b = nil
+			return b, info
+		}
+
+		switch item.Status {
+		case OK:
+			b = item.Value
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusOk += 1
+			if time.Since(item.UpdatedAt) > c.Expiration {
+				expired = append(expired, item)
+				info.TriggerExpired += 1
+			}
+		case EXPIRED:
+			b = item.Value
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusExpired += 1
+		case MISS:
+			b = nil
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusMiss += 1
+		default:
+			// never should be here
+			info.StatusElse += 1
+			b = nil
+			return b, info
+		}
+	} else {
+		unCached = append(unCached, key)
 	}
 
 	// push to list front
@@ -267,7 +280,6 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 	var expired []*Item
 
 	// read in memory
-
 	for _, k := range keys {
 		// preset
 		kvs[k] = nil
@@ -277,52 +289,59 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 		}
 
 		iElement, ok := c.table.Load(k)
-		if !ok {
+		if ok {
+			el, o := iElement.(*list.Element)
+			if !o {
+				// never should be here
+				continue
+			}
+			if el == nil || el.Value == nil {
+				// never should be here
+				continue
+			}
+			item, o := el.Value.(*Item)
+			if !o {
+				// never should be here
+				continue
+			}
+			if item == nil {
+				// never should be here
+				continue
+			}
+
+			switch item.Status {
+			case OK:
+				kvs[k] = item.Value
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusOk += 1
+				if time.Since(item.UpdatedAt) > c.Expiration {
+					expired = append(expired, item)
+					info.TriggerExpired += 1
+				}
+			case EXPIRED:
+				kvs[k] = item.Value
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusExpired += 1
+			case MISS:
+				kvs[k] = nil
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusMiss += 1
+			default:
+				// never should be here
+				info.StatusElse += 1
+				continue
+			}
+		} else {
 			unCached = append(unCached, k)
 			continue
 		}
-
-		el, o := iElement.(*list.Element)
-		if el == nil || el.Value == nil {
-			// never should be here
-			continue
-		}
-		item, o := el.Value.(*Item)
-		if !o {
-			// never should be here
-			continue
-		}
-
-		switch item.Status {
-		case OK:
-			kvs[k] = item.Value
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusOk += 1
-			if time.Since(item.UpdatedAt) > c.Expiration {
-				expired = append(expired, item)
-				info.TriggerExpired += 1
-			}
-		case EXPIRED:
-			kvs[k] = item.Value
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusExpired += 1
-		case MISS:
-			kvs[k] = nil
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusMiss += 1
-		default:
-			// never should be here
-			info.StatusElse += 1
-			continue
-		}
-
 	}
 
 	// push to list front
-	if len(pushFront) > 0 {
+	if len(pushFront) > 0 && len(pushFront) <= 300 {
 		go func(pf []*list.Element) {
 			c.lmu.Lock()
 			defer c.lmu.Unlock()
@@ -330,6 +349,8 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 				c.list.MoveToFront(p)
 			}
 		}(pushFront)
+	} else {
+		pushFront = []*list.Element{}
 	}
 	// set expiration
 	if len(expired) > 0 {
@@ -401,40 +422,51 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 		var expired []*Item
 
 		iElement, ok := c.table.Load(key)
-		if !ok {
+		if ok {
+			el, o := iElement.(*list.Element)
+			if !o {
+				// never should be here
+				return info, err
+			}
+
+			if el == nil || el.Value == nil {
+				// never should be here
+				return info, err
+			}
+
+			item, o := el.Value.(*Item)
+			if !o {
+				// never should be here
+				return info, err
+			}
+
+			if item == nil {
+				// never should be here
+				return info, err
+			}
+
+			switch item.Status {
+			case OK:
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusOk += 1
+				expired = append(expired, item)
+				info.TriggerExpired += 1
+			case EXPIRED:
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusExpired += 1
+			case MISS:
+				pushFront = append(pushFront, el)
+				info.TriggerPushFront += 1
+				info.StatusMiss += 1
+			default:
+				// never should be here
+				info.StatusElse += 1
+				return info, err
+			}
+		} else {
 			unCached = append(unCached, key)
-		}
-
-		el, o := iElement.(*list.Element)
-		if el == nil || el.Value == nil {
-			// never should be here
-			return info, err
-		}
-		item, o := el.Value.(*Item)
-		if !o {
-			// never should be here
-			return info, err
-		}
-
-		switch item.Status {
-		case OK:
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusOk += 1
-			expired = append(expired, item)
-			info.TriggerExpired += 1
-		case EXPIRED:
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusExpired += 1
-		case MISS:
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusMiss += 1
-		default:
-			// never should be here
-			info.StatusElse += 1
-			return info, err
 		}
 
 		// push to list front
