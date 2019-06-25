@@ -60,9 +60,9 @@ type Info struct {
 type Cache struct {
 	lmu    sync.Mutex // protect list
 	list   *list.List
-	mu     sync.RWMutex             // protect cache table
-	table  map[string]*list.Element // cache table
 	maxLen int
+
+	table *sync.Map
 
 	rMu         sync.RWMutex     // protect needRefresh
 	needRefresh map[string]*Item // 需要请求源数据
@@ -110,8 +110,9 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 		source: source,
 
 		list:   list.New(),
-		table:  make(map[string]*list.Element, maxLen),
 		maxLen: defaultMaxLen,
+
+		table: new(sync.Map),
 
 		Expiration:    time.Duration(exp) * time.Second,
 		sourceTimeout: time.Duration(t) * time.Millisecond,
@@ -127,7 +128,7 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 
 func (c *Cache) Get(key string) ([]byte, Info) {
 	info := Info{
-		Cached:           len(c.table),
+		Cached:           c.list.Len(),
 		Total:            1,
 		Empty:            0,
 		StatusOk:         0,
@@ -152,54 +153,50 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 	var pushFront []*list.Element
 	var expired []*Item
 
-	c.mu.RLock()
-	el, ok := c.table[key]
-	if ok {
-		if el == nil || el.Value == nil {
-			// never should be here
-			c.mu.RUnlock()
-			b = nil
-			return b, info
-		}
-		item, o := el.Value.(*Item)
-		if !o {
-			// never should be here
-			c.mu.RUnlock()
-			b = nil
-			return b, info
-		}
-
-		switch item.Status {
-		case OK:
-			b = item.Value
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusOk += 1
-			if time.Since(item.UpdatedAt) > c.Expiration {
-				expired = append(expired, item)
-				info.TriggerExpired += 1
-			}
-		case EXPIRED:
-			b = item.Value
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusExpired += 1
-		case MISS:
-			b = nil
-			pushFront = append(pushFront, el)
-			info.TriggerPushFront += 1
-			info.StatusMiss += 1
-		default:
-			// never should be here
-			info.StatusElse += 1
-			c.mu.RUnlock()
-			b = nil
-			return b, info
-		}
-	} else {
+	iElement, ok := c.table.Load(key)
+	if !ok {
 		unCached = append(unCached, key)
 	}
-	c.mu.RUnlock()
+
+	el, o := iElement.(*list.Element)
+	if el == nil || el.Value == nil {
+		// never should be here
+		b = nil
+		return b, info
+	}
+	item, o := el.Value.(*Item)
+	if !o {
+		// never should be here
+		b = nil
+		return b, info
+	}
+
+	switch item.Status {
+	case OK:
+		b = item.Value
+		pushFront = append(pushFront, el)
+		info.TriggerPushFront += 1
+		info.StatusOk += 1
+		if time.Since(item.UpdatedAt) > c.Expiration {
+			expired = append(expired, item)
+			info.TriggerExpired += 1
+		}
+	case EXPIRED:
+		b = item.Value
+		pushFront = append(pushFront, el)
+		info.TriggerPushFront += 1
+		info.StatusExpired += 1
+	case MISS:
+		b = nil
+		pushFront = append(pushFront, el)
+		info.TriggerPushFront += 1
+		info.StatusMiss += 1
+	default:
+		// never should be here
+		info.StatusElse += 1
+		b = nil
+		return b, info
+	}
 
 	// push to list front
 	if len(pushFront) > 0 {
@@ -250,7 +247,7 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 
 func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 	info := Info{
-		Cached:           len(c.table),
+		Cached:           c.list.Len(),
 		Total:            len(keys),
 		Empty:            0,
 		StatusOk:         0,
@@ -270,7 +267,7 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 	var expired []*Item
 
 	// read in memory
-	c.mu.RLock()
+
 	for _, k := range keys {
 		// preset
 		kvs[k] = nil
@@ -279,48 +276,50 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 			continue
 		}
 
-		el, ok := c.table[k]
-		if ok {
-			if el == nil || el.Value == nil {
-				// never should be here
-				continue
-			}
-			item, o := el.Value.(*Item)
-			if !o {
-				// never should be here
-				continue
-			}
-
-			switch item.Status {
-			case OK:
-				kvs[k] = item.Value
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusOk += 1
-				if time.Since(item.UpdatedAt) > c.Expiration {
-					expired = append(expired, item)
-					info.TriggerExpired += 1
-				}
-			case EXPIRED:
-				kvs[k] = item.Value
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusExpired += 1
-			case MISS:
-				kvs[k] = nil
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusMiss += 1
-			default:
-				// never should be here
-				info.StatusElse += 1
-				continue
-			}
-		} else {
+		iElement, ok := c.table.Load(k)
+		if !ok {
 			unCached = append(unCached, k)
+			continue
 		}
+
+		el, o := iElement.(*list.Element)
+		if el == nil || el.Value == nil {
+			// never should be here
+			continue
+		}
+		item, o := el.Value.(*Item)
+		if !o {
+			// never should be here
+			continue
+		}
+
+		switch item.Status {
+		case OK:
+			kvs[k] = item.Value
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusOk += 1
+			if time.Since(item.UpdatedAt) > c.Expiration {
+				expired = append(expired, item)
+				info.TriggerExpired += 1
+			}
+		case EXPIRED:
+			kvs[k] = item.Value
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusExpired += 1
+		case MISS:
+			kvs[k] = nil
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusMiss += 1
+		default:
+			// never should be here
+			info.StatusElse += 1
+			continue
+		}
+
 	}
-	c.mu.RUnlock()
 
 	// push to list front
 	if len(pushFront) > 0 {
@@ -371,7 +370,7 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 
 func (c *Cache) Set(key string, value []byte) (Info, error) {
 	info := Info{
-		Cached:           len(c.table),
+		Cached:           c.list.Len(),
 		Total:            1,
 		Empty:            0,
 		StatusOk:         0,
@@ -401,49 +400,44 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 		var pushFront []*list.Element
 		var expired []*Item
 
-		c.mu.RLock()
-		el, ok := c.table[key]
-		if ok {
-			if el == nil || el.Value == nil {
-				// never should be here
-				c.mu.RUnlock()
-				return info, err
-			}
-			item, o := el.Value.(*Item)
-			if !o {
-				// never should be here
-				c.mu.RUnlock()
-				return info, err
-			}
-
-			switch item.Status {
-			case OK:
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusOk += 1
-				expired = append(expired, item)
-				info.TriggerExpired += 1
-			case EXPIRED:
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusExpired += 1
-			case MISS:
-				pushFront = append(pushFront, el)
-				info.TriggerPushFront += 1
-				info.StatusMiss += 1
-			default:
-				// never should be here
-				info.StatusElse += 1
-				c.mu.RUnlock()
-				return info, err
-			}
-		} else {
+		iElement, ok := c.table.Load(key)
+		if !ok {
 			unCached = append(unCached, key)
 		}
-		c.mu.RUnlock()
+
+		el, o := iElement.(*list.Element)
+		if el == nil || el.Value == nil {
+			// never should be here
+			return info, err
+		}
+		item, o := el.Value.(*Item)
+		if !o {
+			// never should be here
+			return info, err
+		}
+
+		switch item.Status {
+		case OK:
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusOk += 1
+			expired = append(expired, item)
+			info.TriggerExpired += 1
+		case EXPIRED:
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusExpired += 1
+		case MISS:
+			pushFront = append(pushFront, el)
+			info.TriggerPushFront += 1
+			info.StatusMiss += 1
+		default:
+			// never should be here
+			info.StatusElse += 1
+			return info, err
+		}
 
 		// push to list front
-		// TODO 呵呵，居然有一次拿1000+的，逼我加采样？
 		if len(pushFront) > 0 && len(pushFront) <= 300 {
 			go func(pf []*list.Element) {
 				c.lmu.Lock()
@@ -452,6 +446,8 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 					c.list.MoveToFront(p)
 				}
 			}(pushFront)
+		} else {
+			pushFront = []*list.Element{}
 		}
 		// set expiration
 		if len(expired) > 0 {
@@ -476,46 +472,31 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 		go c.mergeGet(kc, nil, unCached...)
 	}
 
-	c.mu.Lock()
-	defer c.mu.Unlock()
 	// set success, refresh cache
-	if le, o := c.table[key]; o {
-		// 本地已有数据
-		if le == nil || le.Value == nil {
-			// never should be here
-			return info, nil
-		}
-		temp, is := c.table[key].Value.(*Item)
-		if !is {
-			return info, nil
-		}
-		temp.Value = value
-		temp.UpdatedAt = time.Now()
-		temp.Retries = 0
-		temp.Key = key
-		temp.Status = OK
-	} else {
-		// 本地没有数据
-		t := time.Now()
-		it := &Item{
-			Key:       key,
-			Status:    OK,
-			Value:     value,
-			Retries:   0,
-			CreatedAt: t,
-			UpdatedAt: t,
-		}
-
-		c.lmu.Lock()
-		element := c.list.PushFront(it)
-		c.table[key] = element
-		for c.list.Len() > c.maxLen {
-			el := c.list.Back()
-			c.list.Remove(el)
-			delete(c.table, el.Value.(*Item).Key)
-		}
-		c.lmu.Unlock()
+	iElement, ok := c.table.Load(key)
+	if !ok {
+		c.addOk(key, value)
+		return info, nil
 	}
+
+	el, o := iElement.(*list.Element)
+	if el == nil || el.Value == nil {
+		// never should be here
+		return info, nil
+
+	}
+	temp, o := el.Value.(*Item)
+	if !o {
+		// never should be here
+		return info, nil
+	}
+
+	temp.Value = value
+	temp.UpdatedAt = time.Now()
+	temp.Retries = 0
+	temp.Key = key
+	temp.Status = OK
+
 	info.StatusOk += 1
 	return info, nil
 }
@@ -531,73 +512,109 @@ func (c *Cache) mergeGet(kc *CallRes, cancel context.CancelFunc, keys ...string)
 	c.merge(cc)
 }
 
-func (c *Cache) merge(cr map[string]*resItem) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	needFresh := make([]*Item, 0)
-
+func (c *Cache) addMiss(key string) *Item {
 	t := time.Now()
+	it := &Item{
+		Key:       key,
+		Status:    MISS,
+		Value:     nil,
+		Retries:   1,
+		CreatedAt: t,
+		UpdatedAt: t,
+	}
+	c.lmu.Lock()
+	element := c.list.PushFront(it)
+	for c.list.Len() > c.maxLen {
+		el := c.list.Back()
+		c.list.Remove(el)
+		c.table.Delete(el.Value.(*Item).Key)
+	}
+	c.lmu.Unlock()
+	c.table.Store(key, element)
+	return it
+}
+
+func (c *Cache) addOk(key string, value []byte) {
+	t := time.Now()
+	it := &Item{
+		Key:       key,
+		Status:    OK,
+		Value:     value,
+		Retries:   0,
+		CreatedAt: t,
+		UpdatedAt: t,
+	}
+
+	c.lmu.Lock()
+	element := c.list.PushFront(it)
+	for c.list.Len() > c.maxLen {
+		el := c.list.Back()
+		c.list.Remove(el)
+		c.table.Delete(el.Value.(*Item).Key)
+	}
+	c.lmu.Unlock()
+	c.table.Store(key, element)
+}
+
+func (c *Cache) merge(cr map[string]*resItem) {
+	needFresh := make([]*Item, 0)
+	t := time.Now()
+
 	// OK 状态的key，不会进入 c.needRefresh
 	for key, item := range cr {
 		// 远程数据失败
 		if !item.done || item.err != nil {
-			if _, o := c.table[key]; o {
-				// 本地有数据
-				// 无效的请求作废，不能作为更新本地状态的依据
+			_, ok := c.table.Load(key)
+			if ok {
+				// 远程数据失败，不足以修改本地已有数据的状态
 				continue
 			} else {
-				// 本地没有的数据，没有请求成功
-				it := &Item{
-					Key:       key,
-					Status:    MISS,
-					Value:     nil,
-					Retries:   1,
-					CreatedAt: t,
-					UpdatedAt: t,
-				}
-
-				c.lmu.Lock()
-				element := c.list.PushFront(it)
-				c.table[key] = element
-				for c.list.Len() > c.maxLen {
-					el := c.list.Back()
-					c.list.Remove(el)
-					delete(c.table, el.Value.(*Item).Key)
-				}
-				c.lmu.Unlock()
-
+				// 远程数据失败，创建本地MISS数据
+				it := c.addMiss(key)
 				needFresh = append(needFresh, it)
 				continue
 			}
 		}
 
 		// 远程数据成功
-		if _, o := c.table[key]; o {
-			// 本地已有数据
-			temp, is := c.table[key].Value.(*Item)
-			if !is {
+		iElement, ok := c.table.Load(key)
+		if ok {
+			el, o := iElement.(*list.Element)
+			if !o {
+				// never should be here
+				continue
+			}
+			if el == nil || el.Value == nil {
+				// never should be here
+				continue
+			}
+			temp, o := el.Value.(*Item)
+			if !o {
+				// never should be here
+				continue
+			}
+			if temp == nil {
 				// never should be here
 				continue
 			}
 			if item.value == nil {
-				// 源数据不存在
+				// 远程没有数据，本地具备有效数据, 修改本地数据为无效
 				temp.Retries += 1
 				temp.Status = MISS
 				temp.Key = key
-				temp.UpdatedAt = time.Now()
+				temp.UpdatedAt = t
 				temp.Value = nil
 				if temp.Retries >= c.retries {
 					c.lmu.Lock()
-					c.list.Remove(c.table[key])
+					c.list.Remove(el)
 					c.lmu.Unlock()
-					delete(c.table, key)
+					c.table.Delete(key)
 					continue
 				}
 				needFresh = append(needFresh, temp)
 				continue
 			} else {
-				// EXPIRED -> OK
-				// 本地和源数据都存在
+				// 远程有数据，本地也有数据
 				temp.Value = item.value
 				temp.UpdatedAt = time.Now()
 				temp.Retries = 0
@@ -608,49 +625,11 @@ func (c *Cache) merge(cr map[string]*resItem) {
 		} else {
 			// 本地没有数据
 			if item.value == nil {
-				// 远程没有数据
-				it := &Item{
-					Key:       key,
-					Status:    MISS,
-					Value:     nil,
-					Retries:   1,
-					CreatedAt: t,
-					UpdatedAt: t,
-				}
-
-				c.lmu.Lock()
-				element := c.list.PushFront(it)
-				c.table[key] = element
-				for c.list.Len() > c.maxLen {
-					el := c.list.Back()
-					c.list.Remove(el)
-					delete(c.table, el.Value.(*Item).Key)
-				}
-				c.lmu.Unlock()
-
+				it := c.addMiss(key)
 				needFresh = append(needFresh, it)
 				continue
 			} else {
-				// 远程有数据
-				it := &Item{
-					Key:       key,
-					Status:    OK,
-					Value:     item.value,
-					Retries:   0,
-					CreatedAt: t,
-					UpdatedAt: t,
-				}
-
-				c.lmu.Lock()
-				element := c.list.PushFront(it)
-				c.table[key] = element
-				for c.list.Len() > c.maxLen {
-					el := c.list.Back()
-					c.list.Remove(el)
-					delete(c.table, el.Value.(*Item).Key)
-				}
-				c.lmu.Unlock()
-
+				c.addOk(key, item.value)
 				continue
 			}
 		}
