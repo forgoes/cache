@@ -107,23 +107,73 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 	}
 
 	c := &Cache{
-		source: source,
-
 		list:   list.New(),
 		maxLen: defaultMaxLen,
 
 		table: new(sync.Map),
 
+		needRefresh: make(map[string]*Item),
+
+		source:        source,
 		Expiration:    time.Duration(exp) * time.Second,
 		sourceTimeout: time.Duration(t) * time.Millisecond,
-		needRefresh:   make(map[string]*Item),
 		retries:       r,
 		interval:      time.Duration(ri) * time.Second,
-		callMap:       new(CallMap),
+
+		callMap: new(CallMap),
 	}
 
 	go c.refresh()
 	return c, nil
+}
+
+func (c *Cache) convertInterface(i interface{}) (*list.Element, *Item, error) {
+	// never should be error
+	el, ok := i.(*list.Element)
+	if !ok {
+		return nil, nil, errors.New("interface to *list.Element error")
+	}
+
+	if el == nil || el.Value == nil {
+		return nil, nil, errors.New("nil *list.Element")
+	}
+
+	item, ok := el.Value.(*Item)
+	if !ok {
+		return nil, nil, errors.New("*list.Element.Value to *Item error")
+	}
+
+	if item == nil {
+		return nil, nil, errors.New("nil *Item")
+	}
+
+	return el, item, nil
+}
+
+func (c *Cache) pushFront(pf []*list.Element) {
+	c.lmu.Lock()
+	defer c.lmu.Unlock()
+	for _, p := range pf {
+		c.list.MoveToFront(p)
+	}
+}
+
+func (c *Cache) addExpired(items []*Item) {
+	c.rMu.Lock()
+	defer c.rMu.Unlock()
+	for _, i := range items {
+		if atomic.CompareAndSwapInt32((*int32)(&i.Status), int32(OK), int32(EXPIRED)) {
+			c.needRefresh[i.Key] = i
+		}
+	}
+}
+
+func (c *Cache) addRefresh(keys []string) {
+	c.rMu.Lock()
+	defer c.rMu.Unlock()
+	for _, key := range keys {
+		c.needRefresh[key] = nil
+	}
 }
 
 func (c *Cache) Get(key string) ([]byte, Info) {
@@ -155,28 +205,8 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 
 	iElement, ok := c.table.Load(key)
 	if ok {
-		el, ok := iElement.(*list.Element)
-		if !ok {
-			// never should be here
-			b = nil
-			return b, info
-		}
-
-		if el == nil || el.Value == nil {
-			// never should be here
-			b = nil
-			return b, info
-		}
-
-		item, ok := el.Value.(*Item)
-		if !ok {
-			// never should be here
-			b = nil
-			return b, info
-		}
-
-		if item == nil {
-			// never should be here
+		el, item, err := c.convertInterface(iElement)
+		if err != nil {
 			b = nil
 			return b, info
 		}
@@ -203,43 +233,31 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 			info.StatusMiss += 1
 		default:
 			// never should be here
-			info.StatusElse += 1
 			b = nil
+			info.StatusElse += 1
 			return b, info
 		}
 	} else {
 		unCached = append(unCached, key)
 	}
 
-	// push to list front
+	// push front
 	if len(pushFront) > 0 {
-		go func(pf []*list.Element) {
-			c.lmu.Lock()
-			defer c.lmu.Unlock()
-			for _, p := range pf {
-				c.list.MoveToFront(p)
-			}
-		}(pushFront)
-	}
-	// set expiration
-	if len(expired) > 0 {
-		go func(es []*Item) {
-			c.rMu.Lock()
-			defer c.rMu.Unlock()
-			for _, i := range es {
-				if atomic.CompareAndSwapInt32((*int32)(&i.Status), int32(OK), int32(EXPIRED)) {
-					c.needRefresh[i.Key] = i
-				}
-			}
-		}(expired)
+		go c.pushFront(pushFront)
 	}
 
+	// set expiration
+	if len(expired) > 0 {
+		go c.addExpired(expired)
+	}
+
+	// hit the cache and return
 	if len(unCached) <= 0 {
 		return b, info
 	}
-	info.StatusUnCached += len(unCached)
 
 	// get from source
+	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
 	go c.mergeGet(kc, cancel, unCached...)
@@ -290,21 +308,8 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 
 		iElement, ok := c.table.Load(k)
 		if ok {
-			el, o := iElement.(*list.Element)
-			if !o {
-				// never should be here
-				continue
-			}
-			if el == nil || el.Value == nil {
-				// never should be here
-				continue
-			}
-			item, o := el.Value.(*Item)
-			if !o {
-				// never should be here
-				continue
-			}
-			if item == nil {
+			el, item, err := c.convertInterface(iElement)
+			if err != nil {
 				// never should be here
 				continue
 			}
@@ -341,36 +346,23 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 	}
 
 	// push to list front
-	if len(pushFront) > 0 && len(pushFront) <= 300 {
-		go func(pf []*list.Element) {
-			c.lmu.Lock()
-			defer c.lmu.Unlock()
-			for _, p := range pf {
-				c.list.MoveToFront(p)
-			}
-		}(pushFront)
+	if len(pushFront) > 0 && len(pushFront) <= 280 {
+		go c.pushFront(pushFront)
 	} else {
-		pushFront = []*list.Element{}
+		info.TriggerPushFront = 0
 	}
 	// set expiration
 	if len(expired) > 0 {
-		go func(es []*Item) {
-			c.rMu.Lock()
-			defer c.rMu.Unlock()
-			for _, i := range es {
-				if atomic.CompareAndSwapInt32((*int32)(&i.Status), int32(OK), int32(EXPIRED)) {
-					c.needRefresh[i.Key] = i
-				}
-			}
-		}(expired)
+		go c.addExpired(expired)
 	}
 
+	// all in cache and return
 	if len(unCached) <= 0 {
 		return kvs, info
 	}
-	info.StatusUnCached += len(unCached)
 
-	// get from source
+	// need get from source
+	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
 	go c.mergeGet(kc, cancel, unCached...)
@@ -411,7 +403,6 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 	}
 	if value == nil {
 		info.Empty += 1
-		// TODO new field
 		return info, errors.New("nil byte array")
 	}
 
@@ -423,26 +414,10 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 
 		iElement, ok := c.table.Load(key)
 		if ok {
-			el, o := iElement.(*list.Element)
-			if !o {
+			el, item, e := c.convertInterface(iElement)
+			if e != nil {
 				// never should be here
-				return info, err
-			}
-
-			if el == nil || el.Value == nil {
-				// never should be here
-				return info, err
-			}
-
-			item, o := el.Value.(*Item)
-			if !o {
-				// never should be here
-				return info, err
-			}
-
-			if item == nil {
-				// never should be here
-				return info, err
+				return info, e
 			}
 
 			switch item.Status {
@@ -470,67 +445,47 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 		}
 
 		// push to list front
-		if len(pushFront) > 0 && len(pushFront) <= 300 {
-			go func(pf []*list.Element) {
-				c.lmu.Lock()
-				defer c.lmu.Unlock()
-				for _, p := range pf {
-					c.list.MoveToFront(p)
-				}
-			}(pushFront)
-		} else {
-			pushFront = []*list.Element{}
+		if len(pushFront) > 0 {
+			go c.pushFront(pushFront)
 		}
 		// set expiration
 		if len(expired) > 0 {
-			go func(es []*Item) {
-				c.rMu.Lock()
-				defer c.rMu.Unlock()
-				for _, i := range es {
-					if atomic.CompareAndSwapInt32((*int32)(&i.Status), int32(OK), int32(EXPIRED)) {
-						c.needRefresh[i.Key] = i
-					}
-				}
-			}(expired)
+			go c.addExpired(expired)
 		}
 
+		// in cache and return
 		if len(unCached) <= 0 {
 			return info, err
 		}
-		info.StatusUnCached += len(unCached)
 
-		// get from source
+		// get from source and not wait
+		info.StatusUnCached += len(unCached)
 		kc := NewCallRes(unCached...)
 		go c.mergeGet(kc, nil, unCached...)
+		return info, err
+	} else {
+		// set success, refresh cache
+		iElement, ok := c.table.Load(key)
+		if !ok {
+			c.addOk(key, value)
+			return info, nil
+		} else {
+			_, temp, e := c.convertInterface(iElement)
+			if e != nil {
+				// never should be here
+				return info, e
+			}
+			// TODO push front
+			temp.Value = value
+			temp.UpdatedAt = time.Now()
+			temp.Retries = 0
+			temp.Key = key
+			temp.Status = OK
+
+			info.StatusOk += 1
+			return info, nil
+		}
 	}
-
-	// set success, refresh cache
-	iElement, ok := c.table.Load(key)
-	if !ok {
-		c.addOk(key, value)
-		return info, nil
-	}
-
-	el, o := iElement.(*list.Element)
-	if el == nil || el.Value == nil {
-		// never should be here
-		return info, nil
-
-	}
-	temp, o := el.Value.(*Item)
-	if !o {
-		// never should be here
-		return info, nil
-	}
-
-	temp.Value = value
-	temp.UpdatedAt = time.Now()
-	temp.Retries = 0
-	temp.Key = key
-	temp.Status = OK
-
-	info.StatusOk += 1
-	return info, nil
 }
 
 func (c *Cache) mergeGet(kc *CallRes, cancel context.CancelFunc, keys ...string) {
@@ -550,7 +505,7 @@ func (c *Cache) addMiss(key string) *Item {
 		Key:       key,
 		Status:    MISS,
 		Value:     nil,
-		Retries:   1,
+		Retries:   0,
 		CreatedAt: t,
 		UpdatedAt: t,
 	}
@@ -589,21 +544,21 @@ func (c *Cache) addOk(key string, value []byte) {
 }
 
 func (c *Cache) merge(cr map[string]*resItem) {
-	needFresh := make([]*Item, 0)
+	needFresh := make([]string, 0)
 	t := time.Now()
 
-	// OK 状态的key，不会进入 c.needRefresh
 	for key, item := range cr {
 		// 远程数据失败
 		if !item.done || item.err != nil {
 			_, ok := c.table.Load(key)
 			if ok {
 				// 远程数据失败，不足以修改本地已有数据的状态
+				needFresh = append(needFresh, key)
 				continue
 			} else {
 				// 远程数据失败，创建本地MISS数据
-				it := c.addMiss(key)
-				needFresh = append(needFresh, it)
+				c.addMiss(key)
+				needFresh = append(needFresh, key)
 				continue
 			}
 		}
@@ -611,24 +566,12 @@ func (c *Cache) merge(cr map[string]*resItem) {
 		// 远程数据成功
 		iElement, ok := c.table.Load(key)
 		if ok {
-			el, o := iElement.(*list.Element)
-			if !o {
+			el, temp, e := c.convertInterface(iElement)
+			if e != nil {
 				// never should be here
 				continue
 			}
-			if el == nil || el.Value == nil {
-				// never should be here
-				continue
-			}
-			temp, o := el.Value.(*Item)
-			if !o {
-				// never should be here
-				continue
-			}
-			if temp == nil {
-				// never should be here
-				continue
-			}
+
 			if item.value == nil {
 				// 远程没有数据，本地具备有效数据, 修改本地数据为无效
 				temp.Retries += 1
@@ -643,7 +586,7 @@ func (c *Cache) merge(cr map[string]*resItem) {
 					c.table.Delete(key)
 					continue
 				}
-				needFresh = append(needFresh, temp)
+				needFresh = append(needFresh, key)
 				continue
 			} else {
 				// 远程有数据，本地也有数据
@@ -657,14 +600,18 @@ func (c *Cache) merge(cr map[string]*resItem) {
 		} else {
 			// 本地没有数据
 			if item.value == nil {
-				it := c.addMiss(key)
-				needFresh = append(needFresh, it)
+				c.addMiss(key)
+				needFresh = append(needFresh, key)
 				continue
 			} else {
 				c.addOk(key, item.value)
 				continue
 			}
 		}
+	}
+
+	if len(needFresh) > 0 {
+		c.addRefresh(needFresh)
 	}
 }
 
@@ -688,16 +635,6 @@ func (c *Cache) refresh() {
 			}
 		}
 	}
-}
-
-func (c *Cache) AddToRefresh(items []*Item) {
-	go func(is []*Item) {
-		c.rMu.Lock()
-		defer c.rMu.Unlock()
-		for _, i := range is {
-			c.needRefresh[i.Key] = i
-		}
-	}(items)
 }
 
 func (c *Cache) Close() {
