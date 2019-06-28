@@ -45,7 +45,7 @@ func TestMGet(t *testing.T) {
 		IdleTimeout: time.Duration(30) * time.Millisecond,
 	}
 
-	testCache, err := New(source.NewRedisSource(pool), 42, 7, 3, 3, 10000)
+	testCache, err := New(source.NewRedisSource(pool), 1000, 7, 3, 3, 10000)
 	if err != nil {
 		t.Error(err)
 	}
@@ -55,7 +55,7 @@ func TestMGet(t *testing.T) {
 
 	for {
 		println("test key not exists")
-		res, info := testCache.MGet(key)
+		res, info := testCache.MGet(key, "yes", "no")
 		t.Log(info)
 		if res != nil {
 			println("require no answer, but: %s", string(res[key][:]))

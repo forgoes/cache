@@ -108,7 +108,7 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 
 	c := &Cache{
 		list:   list.New(),
-		maxLen: defaultMaxLen,
+		maxLen: ml,
 
 		table: new(sync.Map),
 
