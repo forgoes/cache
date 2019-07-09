@@ -55,7 +55,7 @@ func TestMGet(t *testing.T) {
 
 	for {
 		println("test key not exists")
-		res, info := testCache.MGet(key, "yes", "no")
+		res, info := testCache.MGet([]string{key, "yes", "no"})
 		t.Log(info)
 		if res != nil {
 			println("require no answer, but: %s", string(res[key][:]))

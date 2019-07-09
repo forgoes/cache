@@ -25,6 +25,11 @@ const (
 	defaultMaxLen        = 10000 // 默认最大缓存10000
 )
 
+type MGet func(keys ...string) (map[string][]byte, error)
+type Get func(key string) ([]byte, error)
+type MGetTraceWrapper func(MGet) MGet
+type GetTraceWrapper func(Get) Get
+
 type Source interface {
 	Get(key string) ([]byte, error)
 	MGet(keys ...string) (map[string][]byte, error)
@@ -176,7 +181,7 @@ func (c *Cache) addRefresh(keys []string) {
 	}
 }
 
-func (c *Cache) Get(key string) ([]byte, Info) {
+func (c *Cache) Get(key string, mts ...MGetTraceWrapper) ([]byte, Info) {
 	info := Info{
 		Cached:           c.list.Len(),
 		Total:            1,
@@ -260,7 +265,7 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
-	go c.mergeGet(kc, cancel, unCached...)
+	go c.mergeGet(kc, cancel, unCached)
 
 	<-ctx.Done()
 
@@ -276,7 +281,7 @@ func (c *Cache) Get(key string) ([]byte, Info) {
 	return b, info
 }
 
-func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
+func (c *Cache) MGet(keys []string, mts ...MGetTraceWrapper) (map[string][]byte, Info) {
 	info := Info{
 		Cached:           c.list.Len(),
 		Total:            len(keys),
@@ -365,7 +370,7 @@ func (c *Cache) MGet(keys ...string) (map[string][]byte, Info) {
 	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
-	go c.mergeGet(kc, cancel, unCached...)
+	go c.mergeGet(kc, cancel, unCached)
 
 	<-ctx.Done()
 
@@ -461,7 +466,7 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 		// get from source and not wait
 		info.StatusUnCached += len(unCached)
 		kc := NewCallRes(unCached...)
-		go c.mergeGet(kc, nil, unCached...)
+		go c.mergeGet(kc, nil, unCached)
 		return info, err
 	} else {
 		// set success, refresh cache
@@ -488,12 +493,17 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 	}
 }
 
-func (c *Cache) mergeGet(kc *CallRes, cancel context.CancelFunc, keys ...string) {
+func (c *Cache) mergeGet(kc *CallRes, cancel context.CancelFunc, keys []string, mts ...MGetTraceWrapper) {
 	if cancel != nil {
 		defer cancel()
 	}
 
-	c.callMap.DoMGet(kc, c.source.MGet, keys...)
+	mGet := c.source.MGet
+	for _, mt := range mts {
+		mGet = mt(mGet)
+	}
+
+	c.callMap.DoMGet(kc, mGet, keys...)
 	cc := kc.GetCopy()
 
 	c.merge(cc)
@@ -631,7 +641,7 @@ func (c *Cache) refresh() {
 
 			if len(keys) > 0 {
 				kc := NewCallRes(keys...)
-				c.mergeGet(kc, nil, keys...)
+				c.mergeGet(kc, nil, keys)
 			}
 		}
 	}
