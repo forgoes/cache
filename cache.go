@@ -265,7 +265,7 @@ func (c *Cache) Get(key string, mts ...MGetTraceWrapper) ([]byte, Info) {
 	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
-	go c.mergeGet(kc, cancel, unCached)
+	go c.mergeGet(kc, cancel, unCached, mts...)
 
 	<-ctx.Done()
 
@@ -370,7 +370,7 @@ func (c *Cache) MGet(keys []string, mts ...MGetTraceWrapper) (map[string][]byte,
 	info.StatusUnCached += len(unCached)
 	ctx, cancel := context.WithTimeout(context.TODO(), c.sourceTimeout)
 	kc := NewCallRes(unCached...)
-	go c.mergeGet(kc, cancel, unCached)
+	go c.mergeGet(kc, cancel, unCached, mts...)
 
 	<-ctx.Done()
 
