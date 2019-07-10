@@ -8,6 +8,19 @@ import (
 	"github.com/govine/cache/source"
 )
 
+var MGetTraceWrap = func(
+	host string,
+	port int,
+	db string) func(MGet) MGet {
+	return func(mGet MGet) MGet {
+		return func(keys ...string) (map[string][]byte, error) {
+			println("wrapper——————", host, port, db)
+			res, err := mGet(keys...)
+			return res, err
+		}
+	}
+}
+
 func TestMGet(t *testing.T) {
 	connectTimeout := time.Duration(50) * time.Millisecond
 	auth := ""
@@ -55,7 +68,7 @@ func TestMGet(t *testing.T) {
 
 	for {
 		println("test key not exists")
-		res, info := testCache.MGet([]string{key, "yes", "no"})
+		res, info := testCache.MGet([]string{key, "yes", "no"}, MGetTraceWrap("hello", 6379, "0"))
 		t.Log(info)
 		if res != nil {
 			println("require no answer, but: %s", string(res[key][:]))

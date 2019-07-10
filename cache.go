@@ -37,15 +37,6 @@ type Source interface {
 	Close()
 }
 
-type Item struct {
-	Key       string
-	Value     []byte
-	Status    status
-	Retries   int
-	CreatedAt time.Time
-	UpdatedAt time.Time
-}
-
 type Info struct {
 	Cached           int
 	Total            int
@@ -69,8 +60,8 @@ type Cache struct {
 
 	table *sync.Map
 
-	rMu         sync.RWMutex     // protect needRefresh
-	needRefresh map[string]*Item // 需要请求源数据
+	rMu         sync.RWMutex           // protect needRefresh
+	needRefresh map[string]interface{} // 需要请求源数据
 
 	source        Source        // data source
 	Expiration    time.Duration // 过期时间
@@ -117,7 +108,7 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 
 		table: new(sync.Map),
 
-		needRefresh: make(map[string]*Item),
+		needRefresh: make(map[string]interface{}),
 
 		source:        source,
 		Expiration:    time.Duration(exp) * time.Second,
@@ -163,13 +154,11 @@ func (c *Cache) pushFront(pf []*list.Element) {
 	}
 }
 
-func (c *Cache) addExpired(items []*Item) {
+func (c *Cache) addExpired(keys []string) {
 	c.rMu.Lock()
 	defer c.rMu.Unlock()
-	for _, i := range items {
-		if atomic.CompareAndSwapInt32((*int32)(&i.Status), int32(OK), int32(EXPIRED)) {
-			c.needRefresh[i.Key] = i
-		}
+	for _, i := range keys {
+		c.needRefresh[i] = nil
 	}
 }
 
@@ -206,7 +195,7 @@ func (c *Cache) Get(key string, mts ...MGetTraceWrapper) ([]byte, Info) {
 	var b []byte
 	var unCached []string
 	var pushFront []*list.Element
-	var expired []*Item
+	var expired []string
 
 	iElement, ok := c.table.Load(key)
 	if ok {
@@ -223,7 +212,9 @@ func (c *Cache) Get(key string, mts ...MGetTraceWrapper) ([]byte, Info) {
 			info.TriggerPushFront += 1
 			info.StatusOk += 1
 			if time.Since(item.UpdatedAt) > c.Expiration {
-				expired = append(expired, item)
+				if atomic.CompareAndSwapInt32((*int32)(&item.Status), int32(OK), int32(EXPIRED)) {
+					expired = append(expired, item.Key)
+				}
 				info.TriggerExpired += 1
 			}
 		case EXPIRED:
@@ -300,7 +291,7 @@ func (c *Cache) MGet(keys []string, mts ...MGetTraceWrapper) (map[string][]byte,
 	kvs := make(map[string][]byte)
 	var unCached []string
 	var pushFront []*list.Element
-	var expired []*Item
+	var expired []string
 
 	// read in memory
 	for _, k := range keys {
@@ -326,7 +317,9 @@ func (c *Cache) MGet(keys []string, mts ...MGetTraceWrapper) (map[string][]byte,
 				info.TriggerPushFront += 1
 				info.StatusOk += 1
 				if time.Since(item.UpdatedAt) > c.Expiration {
-					expired = append(expired, item)
+					if atomic.CompareAndSwapInt32((*int32)(&item.Status), int32(OK), int32(EXPIRED)) {
+						expired = append(expired, item.Key)
+					}
 					info.TriggerExpired += 1
 				}
 			case EXPIRED:
@@ -415,7 +408,7 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 	if err != nil {
 		var unCached []string
 		var pushFront []*list.Element
-		var expired []*Item
+		var expired []string
 
 		iElement, ok := c.table.Load(key)
 		if ok {
@@ -430,7 +423,9 @@ func (c *Cache) Set(key string, value []byte) (Info, error) {
 				pushFront = append(pushFront, el)
 				info.TriggerPushFront += 1
 				info.StatusOk += 1
-				expired = append(expired, item)
+				if atomic.CompareAndSwapInt32((*int32)(&item.Status), int32(OK), int32(EXPIRED)) {
+					expired = append(expired, item.Key)
+				}
 				info.TriggerExpired += 1
 			case EXPIRED:
 				pushFront = append(pushFront, el)
@@ -511,20 +506,14 @@ func (c *Cache) mergeGet(kc *CallRes, cancel context.CancelFunc, keys []string, 
 
 func (c *Cache) addMiss(key string) *Item {
 	t := time.Now()
-	it := &Item{
-		Key:       key,
-		Status:    MISS,
-		Value:     nil,
-		Retries:   0,
-		CreatedAt: t,
-		UpdatedAt: t,
-	}
+	it := newItem(key, nil, MISS, 0, t, t)
 	c.lmu.Lock()
 	element := c.list.PushFront(it)
 	for c.list.Len() > c.maxLen {
 		el := c.list.Back()
 		c.list.Remove(el)
 		c.table.Delete(el.Value.(*Item).Key)
+		putItem(el.Value.(*Item))
 	}
 	c.lmu.Unlock()
 	c.table.Store(key, element)
@@ -533,14 +522,7 @@ func (c *Cache) addMiss(key string) *Item {
 
 func (c *Cache) addOk(key string, value []byte) {
 	t := time.Now()
-	it := &Item{
-		Key:       key,
-		Status:    OK,
-		Value:     value,
-		Retries:   0,
-		CreatedAt: t,
-		UpdatedAt: t,
-	}
+	it := newItem(key, value, OK, 0, t, t)
 
 	c.lmu.Lock()
 	element := c.list.PushFront(it)
@@ -548,6 +530,7 @@ func (c *Cache) addOk(key string, value []byte) {
 		el := c.list.Back()
 		c.list.Remove(el)
 		c.table.Delete(el.Value.(*Item).Key)
+		putItem(el.Value.(*Item))
 	}
 	c.lmu.Unlock()
 	c.table.Store(key, element)
@@ -594,6 +577,7 @@ func (c *Cache) merge(cr map[string]*resItem) {
 					c.list.Remove(el)
 					c.lmu.Unlock()
 					c.table.Delete(key)
+					putItem(el.Value.(*Item))
 					continue
 				}
 				needFresh = append(needFresh, key)
