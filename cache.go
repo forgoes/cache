@@ -23,6 +23,7 @@ const (
 	defaultRetryInterval = 60    // MISS状态重试间隔 (s)
 	defaultExpiration    = 420   // 数据过期时间 (s)
 	defaultMaxLen        = 10000 // 默认最大缓存10000
+	defaultMaxMgetLen    = 30    // 默认最大mget长度
 )
 
 type MGet func(keys ...string) (map[string][]byte, error)
@@ -79,9 +80,11 @@ type Cache struct {
 	interval      time.Duration // 重试时间间隔 (s)
 
 	callMap *CallMap
+
+	maxMGetLen int
 }
 
-func New(source Source, sourceTimeout int64, retries int, retryInterval int, expiration int, maxLen int) (*Cache, error) {
+func New(source Source, sourceTimeout int64, retries int, retryInterval int, expiration int, maxLen, maxMgetLen int) (*Cache, error) {
 	if source == nil {
 		return nil, errors.New("nil source")
 	}
@@ -111,6 +114,11 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 		ml = defaultMaxLen
 	}
 
+	mml := maxMgetLen
+	if mml <= 0 {
+		mml = defaultMaxMgetLen
+	}
+
 	c := &Cache{
 		list:   list.New(),
 		maxLen: ml,
@@ -126,6 +134,8 @@ func New(source Source, sourceTimeout int64, retries int, retryInterval int, exp
 		interval:      time.Duration(ri) * time.Second,
 
 		callMap: new(CallMap),
+
+		maxMGetLen: mml,
 	}
 
 	go c.refresh()
@@ -634,14 +644,23 @@ func (c *Cache) refresh() {
 			for k := range c.needRefresh {
 				keys = append(keys, k)
 			}
-			for k := range c.needRefresh {
-				delete(c.needRefresh, k)
-			}
+			c.needRefresh = make(map[string]*Item)
 			c.rMu.Unlock()
 
-			if len(keys) > 0 {
-				kc := NewCallRes(keys...)
-				c.mergeGet(kc, nil, keys)
+			for {
+				end := len(keys)
+				if end == 0 {
+					break
+				} else if end > c.maxMGetLen {
+					end = c.maxMGetLen
+					kc := NewCallRes(keys[0:end]...)
+					c.mergeGet(kc, nil, keys[0:end])
+				} else {
+					kc := NewCallRes(keys...)
+					c.mergeGet(kc, nil, keys)
+					break
+				}
+				keys = keys[end:]
 			}
 		}
 	}
